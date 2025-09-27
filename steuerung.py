@@ -265,7 +265,7 @@ async def get_tibber():
     timeout = 0
     while True:
         timeout += 60
-        logger.info(f'Trying to setup Tibber connection - wait for {timeout}s.')
+        logger.warning(f'Trying to setup Tibber connection - wait for {timeout}s.')
         await asyncio.sleep(timeout)
 
         try:
@@ -278,7 +278,7 @@ async def get_tibber():
             assert home.rt_subscription_running
             break
         except:
-            logger.info('Retrying to establish tibber connection...')
+            logger.warning('Retrying to reestablish tibber connection...')
             try:
                 await tc.close_connection()
                 await asyncio.sleep(10)
@@ -417,9 +417,9 @@ async def main():
         #        continue
 
 
-        if not home.rt_subscription_running:
-            await get_tibber()
-            continue
+        #if not home.rt_subscription_running:
+        #    await get_tibber()
+        #    continue
     
         try:
             t, reading = get_robust_reading(N=10, which='median')
