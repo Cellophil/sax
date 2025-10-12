@@ -3,6 +3,8 @@
 from pyModbusTCP.client import ModbusClient
 from pyModbusTCP.utils import long_list_to_word
 import numpy as np
+import os
+from pathlib import Path
 
 import tibber.const
 import tibber
@@ -12,11 +14,30 @@ import pandas as pd
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import time
 import matplotlib.pyplot as plt
 
 from astral import LocationInfo
 from astral.sun import sun
+try:
+    from .config import (
+        BATTERY_IPS, BATTERIES, N_BATTERIES,
+        POWER_LIMIT_CHARGE_MAX_W, POWER_LIMIT_DISCHARGE_MIN_W,
+        SOC_MIN, SOC_MAX, TIBBER_TOKEN, get_effective_soc_limits,
+    )
+    from .controller import BatteryFleetController
+    from .strategy import Strategy, StrategyContext, decide_strategy, strategy_to_setpoint, normalize_prices_15
+    from .fast_control import FastController, FastControlConfig
+except ImportError:
+    from config import (
+        BATTERY_IPS, BATTERIES, N_BATTERIES,
+        POWER_LIMIT_CHARGE_MAX_W, POWER_LIMIT_DISCHARGE_MIN_W,
+        SOC_MIN, SOC_MAX, TIBBER_TOKEN, get_effective_soc_limits,
+    )
+    from controller import BatteryFleetController
+    from strategy import Strategy, StrategyContext, decide_strategy, strategy_to_setpoint, normalize_prices_15
+    from fast_control import FastController, FastControlConfig
 
 #%%
 def set_up_plot():
@@ -27,183 +48,144 @@ def update_plots(measurements):
 
 #%%
 
-N_battery = 3
-
-def get_tcp_client(battery):
-
-    if battery == 'A':
-        ip="192.168.178.127"
-    elif battery == 'B':
-        ip="192.168.178.130"
-    elif battery == 'C':
-        ip="192.168.178.132"
-    try:
-        client = ModbusClient(host=ip, port=502, unit_id=64, auto_open=True, auto_close=True)
-        return client
-    except:
-        return None
-
-def get_soc(battery=None):
-    
-    soc = 0
-
-    if battery is not None:
-        try:
-            client = get_tcp_client(battery)
-            soc += client.read_holding_registers(46, 1)[0]
-            return soc
-        except:
-            return -1
-
-    try:
-        for battery in ['A','B','C']:
-            client = get_tcp_client(battery)
-            soc += client.read_holding_registers(46, 1)[0]
-        return soc / N_battery
-    except:
-        return -1
+N_battery = N_BATTERIES
 
 async def update_soc():
-    global soc
+    global soc, fleet
+    if fleet is None:
+        fleet = BatteryFleetController()
     while True:
-
-        error = False
-        new_soc = []
-        for battery in ['A','B','C']:
-            try:
-                client = get_tcp_client(battery)
-                _soc = client.read_holding_registers(46, 1)[0]
-                client.close()
-            except:
-                _soc = soc[battery]
-                logger.warning(f'Could not read SOC of {battery}... retry in 60s. Retain old value.')
-            new_soc.append(_soc)
-            
-
-        soc = {'total':(new_soc[0]+new_soc[1]+new_soc[2])/3, 'A':new_soc[0], 'B':new_soc[1], 'C':new_soc[2]}    
-
+        try:
+            per = fleet.read_soc_all()
+            if per:
+                soc = {**per, 'total': float(np.mean([per[b] for b in BATTERIES if b in per]))}
+        except Exception:
+            logger.warning('Could not read SOCs via fleet; retain old value.')
         await asyncio.sleep(60)
     
 
 def _set_power(p, battery):
-    p = int(p)
-    assert battery in ['A','B','C']
-
-    try:
-        client = get_tcp_client(battery)
-        _soc = soc[battery]
-
-        if p > 3700:
-            logger.warning(f'Power limit (per battery) {3.7:.2}kW')
-            p = 3700
-        elif p < -2400:
-            logger.warning(f'Power limit (per battery) -{2.4:.2}kW')
-            p = -2400
-
-    
-        if (p > 0) and (_soc < 15):
-            p = 0
-            logger.warning('Overwriting power here to save battery - low soc.')
-        if (p < 0) and (_soc > 95):
-            logger.warning('Overwriting power here to save battery - high soc.')
-            p = 0
-        
-        
-        if p >= 0:
-            client.write_multiple_registers(41, [p])
-        else:
-            client.write_multiple_registers(41, [65536+p])
-    except:
-        logger.warning(f'Could not communicate with battery {battery}.')
+    # Deprecated: use fleet.set_total_power instead
+    return
 
 
 def set_power(p):
     global soc
+    global fleet
 
-    p /= N_battery
-    p = int(p)
+    # Initialize fleet controller lazily
+    if fleet is None:
+        fleet = BatteryFleetController()
 
-    for battery in ['A','B','C']:
-        _set_power(p, battery)
+    # Fleet expects the total setpoint; it will distribute and respect SOC bounds
+    # Fleet uses its persisted SOC bounds; they default to weekly overrides
+    fleet.set_total_power(int(p), {b: soc.get(b) for b in BATTERIES})
 
 
 def _get_power(battery):
-
-    try:
-        client = get_tcp_client(battery)
-        attempts = 0
-        _p = -9999
-        while _p == -9999:
-            _p = client.read_holding_registers(47, 1)[0]
-            if _p is None:
-                _p = -9999
-            if _p > 0:
-                break
-            attempts += 1
-            if attempts > 10:
-                logger.warning(f'Could not read current power level of battery {battery}.')
-                client.close()
-                return -9999
-            time.sleep(1)
-        _p = (_p - 32768//2)
-
-        client.close()
-        return _p
-    except:
-        return -9999
+    # Deprecated: use fleet.read_power_all / read_total_power
+    return -9999
 
 def get_power():
-    p = 0
-    N = 0
-
-    for battery in ['A','B','C']:
-        _p = _get_power(battery)
-        if not (_p==-9999):
-            p += _p
-            N += 1
-    #p /= (N+1e-6)
-    return p
+    # Deprecated: use fleet.read_total_power
+    return 0
 
 async def update_power():
-
-    global p_t, current_p
+    global p_t, current_p, fleet
+    if fleet is None:
+        fleet = BatteryFleetController()
     current_p = {}
-
     while True:
-
-        for battery in ['A', 'B', 'C']:
-            _p = _get_power(battery)
-            if _p == -9999:
-                # best guess: old value * 0.9
-                _p = current_p[battery] * 0.9
-            current_p[battery] = _p
-        current_p['total'] = current_p['A']+current_p['B']+current_p['C']
-        current_p['t'] = datetime.now(ZoneInfo("Europe/Berlin"))
-        p_t.append(current_p)
-
+        try:
+            per = fleet.read_power_all()
+            for b in BATTERIES:
+                if b in per:
+                    current_p[b] = per[b]
+                else:
+                    # best guess if missing
+                    current_p[b] = int(current_p.get(b, 0) * 0.9)
+            current_p['total'] = sum(current_p.get(b, 0) for b in BATTERIES)
+            current_p['t'] = datetime.now(ZoneInfo("Europe/Berlin"))
+            p_t.append(current_p.copy())
+        except Exception:
+            logger.warning('Could not read power via fleet; retaining last values.')
         await asyncio.sleep(2)
 
 
 async def soll_power():
-    
-    global set_p, soc
-    battery_i = 0
-    battery_index = {0:'A',1:'B',2:'C'}
-
+    # Deprecated: replaced by strategy_loop
     while True:
+        await asyncio.sleep(5)
 
-        # check if set_p is up to date
-        if (datetime.now(ZoneInfo("Europe/Berlin")) - set_p['t']).seconds > 30:
-            set_p['t'] = datetime.now(ZoneInfo("Europe/Berlin"))
-            set_p['p'] = 0.
-            logger.warning('Didnt get up to date setpoint of batteries - 30s old - setting zero.')
+async def strategy_loop():
+    """Periodic high-level decision loop producing a total fleet setpoint.
 
-        battery_i += 1
-        battery_i = battery_i % 3
-        battery = battery_index[battery_i]
+    Runs every few minutes, consuming 15-min price series, SOC, and current power.
+    """
+    global soc, current_p, prices_series_15, fast_ctrl, fleet
+    while True:
+        try:
+            # Align to quarter-hour boundaries
+            now = pd.Timestamp.now(tz=ZoneInfo("Europe/Berlin"))
+            next_q = now.ceil("15min")
+            sleep_s = max(0.0, (next_q - now).total_seconds())
+            await asyncio.sleep(sleep_s)
 
-        _set_power(set_p['p']/3., battery)
-        await asyncio.sleep(1)
+            now = pd.Timestamp.now(tz=ZoneInfo("Europe/Berlin"))
+            prices_norm = normalize_prices_15(prices_series_15 if 'prices_series_15' in globals() else None)
+            ctx = StrategyContext(
+                now=now.to_pydatetime(),
+                prices_15=prices_norm,
+                soc_total=float(soc.get('total', 0) or 0),
+                soc_per={b: float(soc.get(b, 0) or 0) for b in BATTERIES},
+                current_total_power_w=float(current_p.get('total', 0) or 0),
+            )
+            strat, maybe_energy_Wh = decide_strategy(ctx)
+
+            # Ensure fleet and fast controller exist
+            if fleet is None:
+                fleet = BatteryFleetController()
+            if 'fast_ctrl' not in globals() or fast_ctrl is None:
+                fast_ctrl = FastController(fleet)
+                # Measurement function: use Tibber net reading; invert sign to make positive=export
+                async def measure_net():
+                    try:
+                        return -float(measurement[-1][1]) if measurement else 0.0
+                    except Exception:
+                        return 0.0
+                asyncio.create_task(fast_ctrl.run(measure_net))
+
+            # Update controller mode based on strategy
+            fast_ctrl.update_from_strategy(strat, maybe_energy_Wh, now=now)
+            # Strategy log: current 15-min price, max price next 24h, SOC
+            try:
+                price_now = None
+                price_max = None
+                price_max_t = None
+                if prices_norm is not None and len(prices_norm) > 0:
+                    q_start = now.floor("15min")
+                    # current price: nearest in index (it should be aligned already)
+                    idxer = prices_norm.index.get_indexer([q_start], method="nearest")
+                    if idxer is not None and idxer.size == 1 and idxer[0] != -1:
+                        price_now = float(prices_norm.iloc[idxer[0]])
+                    future = prices_norm.loc[q_start : q_start + pd.Timedelta(hours=24)]
+                    if len(future) > 0:
+                        price_max = float(future.max())
+                        price_max_t = future.idxmax()
+                strategy_logger.info(
+                    "strategy=%s energy_Wh=%s soc=%.1f price_now=%s price_max_24h=%s at=%s",
+                    strat.name,
+                    f"{maybe_energy_Wh:.0f}" if isinstance(maybe_energy_Wh, (int, float)) else "-",
+                    ctx.soc_total,
+                    f"{price_now:.3f}" if price_now is not None else "-",
+                    f"{price_max:.3f}" if price_max is not None else "-",
+                    f"{price_max_t}" if price_max_t is not None else "-",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Strategy loop error: {e}")
+        # loop continues; we'll align to next quarter at the top
 
 
 def test_battery(battery):
@@ -269,7 +251,7 @@ async def get_tibber():
         await asyncio.sleep(timeout)
 
         try:
-            tc = tibber.Tibber('VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU', user_agent="Andreas")
+            tc = tibber.Tibber(TIBBER_TOKEN, user_agent="Andreas")
             await tc.update_info()
             print(tc.name)
             home = tc.get_homes()[0]
@@ -289,17 +271,22 @@ async def get_tibber():
 
 
 async def update_price():
-    global prices, home
+    global prices, home, prices_series_15
     prices=np.array([30.]*11)
+    prices_series_15 = None
 
     while True:
 
         try:
             _price = pd.Series(home.price_total)
-            _price.index = pd.to_datetime(_price.index)
-            _price = _price.loc[[t for t in _price.index if t + pd.Timedelta('1h') > datetime.now(ZoneInfo("Europe/Berlin"))]]
-        except:
+            # Normalize to tz-aware 15-min series for strategy
+            prices_series_15 = normalize_prices_15(_price)
+            # Backward compatible numpy fallback for legacy code paths
+            _price_idx = pd.to_datetime(_price.index)
+            _price = _price.loc[[t for t in _price_idx if t + pd.Timedelta('1h') > datetime.now(ZoneInfo("Europe/Berlin"))]]
+        except Exception:
             _price = pd.Series([])
+            prices_series_15 = None
             logger.warning(f'Price problems...')
 
         logger.debug(f'Raw prices: {_price}')
@@ -397,6 +384,7 @@ async def main():
     asyncio.create_task(update_power())
     set_p = {'t':datetime.now(ZoneInfo("Europe/Berlin")), 'p':0.}
     asyncio.create_task(soll_power())
+    asyncio.create_task(strategy_loop())
         
     logger = logging.getLogger('sax')
 
@@ -404,6 +392,12 @@ async def main():
     await asyncio.sleep(20)
     
     asyncio.create_task(update_price())
+    
+    # Optionally start a fast controller in aggressive times. For now, keep it idle; you can
+    # start it conditionally from decide_strategy (by flipping a flag) or here.
+    # Example hook (commented):
+    # fleet_ctrl = FastController(fleet)
+    # asyncio.create_task(fleet_ctrl.run(lambda: measurement[-1][1] if measurement else 0, mode="aggressive"))
 
     while True:
         
@@ -443,7 +437,7 @@ async def main():
         
         if reading == 0:
             # could be an error that reading... idle
-            asyncio.sleep(1)
+            await asyncio.sleep(1)
             logger.info(f'Reading says exactly 0 - could be correct, but assuming a communication error.')
 
         elif consumption < -10:
@@ -530,11 +524,26 @@ console.setFormatter(formatter)
 logger.addHandler(console)
 
 date = datetime.today().strftime('%Y-%m-%d')
-fileHandler = logging.FileHandler(f"/home/andreas/sax/steuerung_{date}.log")
+log_file = Path(__file__).with_name(f"steuerung_{date}.log")
+fileHandler = TimedRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=7, encoding="utf-8")
 fileHandler.setFormatter(formatter)
 logger.addHandler(fileHandler)
 
 logger.debug('test message')
+
+fleet: BatteryFleetController | None = None
+fast_ctrl: FastController | None = None
+
+# Dedicated strategy logger
+strategy_logger = logging.getLogger('sax.strategy')
+strategy_logger.setLevel(logging.INFO)
+strategy_log_file = Path(__file__).with_name("strategy.log")
+try:
+    s_file = TimedRotatingFileHandler(strategy_log_file, when="midnight", interval=1, backupCount=7, encoding="utf-8")
+    s_file.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+    strategy_logger.addHandler(s_file)
+except Exception:
+    pass
 
 #%%
 #await main()

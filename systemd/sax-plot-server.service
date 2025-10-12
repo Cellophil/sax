@@ -1,0 +1,14 @@
+[Unit]
+Description=SAX Plot static file server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sax/sax/plots
+ExecStart=/usr/bin/python3 -m http.server 8088 --bind 0.0.0.0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

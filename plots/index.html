@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SAX Strategy Plot</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #101317; color: #eaeaea; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, sans-serif; }
+    header { padding: 10px 14px; background: #161b22; position: sticky; top: 0; z-index: 1; box-shadow: 0 1px 0 rgba(255,255,255,0.06); }
+    main { display: grid; place-items: center; padding: 10px; }
+    img { width: min(1200px, 95vw); height: auto; border-radius: 6px; box-shadow: 0 4px 30px rgba(0,0,0,0.5); background: #0b0e12; }
+    .hint { color: #9aa4b2; font-size: 13px; }
+    .row { display: flex; gap: 12px; align-items: center; }
+    .time { font-variant-numeric: tabular-nums; font-size: 14px; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+  <script>
+    function refresh(){
+      const frame = document.getElementById('plot');
+      const now = new Date();
+      const base = 'strategy.html';
+      const url = base + (base.includes('?') ? '&' : '?') + 'ts=' + now.getTime();
+      frame.src = url;
+      document.getElementById('time').textContent = now.toLocaleString();
+    }
+    setInterval(refresh, 60 * 1000);
+    window.addEventListener('load', refresh);
+  </script>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <strong>SAX Strategy Plot</strong>
+      <span class="hint">Auto-refreshes every 60s</span>
+      <span class="time" id="time"></span>
+    </div>
+  </header>
+  <main>
+    <iframe id="plot" src="strategy.html" style="width:min(1200px,95vw);height:80vh;border:none;border-radius:6px;box-shadow:0 4px 30px rgba(0,0,0,0.5);"></iframe>
+  </main>
+</body>
+</html>

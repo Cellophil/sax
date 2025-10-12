@@ -1,0 +1,11 @@
+# /etc/systemd/system/sax-restart.timer
+[Unit]
+Description=Daily restart of SAX Battery Control Service at midnight
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+Persistent=true
+Unit=sax-restart.service
+
+[Install]
+WantedBy=timers.target

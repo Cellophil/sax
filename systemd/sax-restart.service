@@ -1,0 +1,7 @@
+# /etc/systemd/system/sax-restart.service
+[Unit]
+Description=Restart SAX Battery Control Service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart sax.service

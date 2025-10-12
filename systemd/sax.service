@@ -1,0 +1,24 @@
+# /etc/systemd/system/sax.service
+[Unit]
+Description=SAX Battery Control Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust ExecStart path to your Python and repository path on the target host
+# Example uses a venv in /home/<user>/sax/.venv
+Environment=TIBBER_TOKEN=
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/andreas/sax
+ExecStart=/home/andreas/sax/.venv/bin/python -m sax.steuerung
+Restart=always
+RestartSec=10
+# Optional: Limit resources, add nice/IOSchedulingPriority if desired
+
+# Log to journald; steuerung.py also writes its own rotating file
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
