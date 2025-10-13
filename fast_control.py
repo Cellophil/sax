@@ -118,13 +118,13 @@ class FastController:
         self._last_ts = None
 
     def update_from_strategy(self, strat: Strategy, maybe_energy_Wh: Optional[float], now: Optional[datetime] = None) -> None:
-        aggressive = strat in (Strategy.DISCHARGE_AGGRESSIVE, Strategy.CHARGE_AGGRESSIVE, Strategy.BALANCE_AGGRESSIVE)
+        aggressive = strat in (Strategy.DISCHARGE_AGGRESSIVE, Strategy.BALANCE_AGGRESSIVE)
         if strat in (Strategy.IDLE, Strategy.BALANCE, Strategy.BALANCE_AGGRESSIVE):
             self.set_mode("balance", aggressive=aggressive, now=now)
         elif strat in (Strategy.DISCHARGE, Strategy.DISCHARGE_AGGRESSIVE):
             bias = self.cfg.discharge_bias_aggr_w if aggressive else self.cfg.discharge_bias_w
             self.set_mode("discharge", aggressive=aggressive, discharge_bias_w=bias, now=now)
-        else:  # CHARGE*, CHARGE_MAX
+        elif strat in (Strategy.CHARGE, getattr(Strategy, 'CHARGE_GRID', Strategy.CHARGE)):
             self.set_mode("charge", aggressive=aggressive, charge_energy_Wh=(maybe_energy_Wh or 0.0), now=now)
 
     def _clip_total(self, total_w: int) -> int:

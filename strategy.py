@@ -300,7 +300,8 @@ def decide_strategy(ctx: StrategyContext) -> Tuple[Strategy, Optional[int]]:
         # are we charging above PV generation?
         if -n.storage_units_t['p'].loc[t[0], 'battery'] >= n.generators_t['p'].loc[t[0], 'pv']+200:
             # yes, we are charging above PV generation
-            return Strategy.CHARGE, int(-n.storage_units_t['p'].loc[t[0], 'battery'])*0.15
+            # Convert W at the first snapshot to Wh over 15 minutes: Wh = W * 0.25h
+            return Strategy.CHARGE, int(-n.storage_units_t['p'].loc[t[0], 'battery'] * 0.25)
         # just charge normally
         return Strategy.CHARGE, 0
 
