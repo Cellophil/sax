@@ -4,7 +4,6 @@ import numpy as np
 import os
 from pathlib import Path
 
-import tibber.const
 import tibber
 import asyncio
 import aiohttp
@@ -12,24 +11,28 @@ import pandas as pd
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import logging
+import time
+import inspect
 from logging.handlers import TimedRotatingFileHandler
 try:
     from .config import (
         BATTERY_IPS, BATTERIES, N_BATTERIES,
         POWER_LIMIT_CHARGE_MAX_W, POWER_LIMIT_DISCHARGE_MIN_W,
         SOC_MIN, SOC_MAX, TIBBER_TOKEN, get_effective_soc_limits,
+        TIBBER_USER_AGENT,
     )
     from .controller import BatteryFleetController
-    from .strategy import Strategy, StrategyContext, decide_strategy, strategy_to_setpoint, normalize_prices_15
+    from .strategy import Strategy, StrategyContext, decide_strategy, normalize_prices_15
     from .fast_control import FastController, FastControlConfig
 except ImportError:
     from config import (
         BATTERY_IPS, BATTERIES, N_BATTERIES,
         POWER_LIMIT_CHARGE_MAX_W, POWER_LIMIT_DISCHARGE_MIN_W,
         SOC_MIN, SOC_MAX, TIBBER_TOKEN, get_effective_soc_limits,
+        TIBBER_USER_AGENT,
     )
     from controller import BatteryFleetController
-    from strategy import Strategy, StrategyContext, decide_strategy, strategy_to_setpoint, normalize_prices_15
+    from strategy import Strategy, StrategyContext, decide_strategy, normalize_prices_15
     from fast_control import FastController, FastControlConfig
 
 #%%
@@ -80,9 +83,9 @@ async def update_power():
             current_p['total'] = sum(current_p.get(b, 0) for b in BATTERIES)
             current_p['t'] = datetime.now(ZoneInfo("Europe/Berlin"))
             p_t.append(current_p.copy())
-        except Exception:
-            logger.warning('Could not read power via fleet; retaining last values.')
-    await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning(f'Could not read power via fleet; retaining last values. err={e}')
+        await asyncio.sleep(2)
 
 
 async def strategy_loop():
@@ -101,8 +104,10 @@ async def strategy_loop():
 
             now = pd.Timestamp.now(tz=ZoneInfo("Europe/Berlin"))
             prices_norm = normalize_prices_15(prices_series_15 if 'prices_series_15' in globals() else None)
+            # Ensure ctx.now is a pandas.Timestamp so .floor works reliably
+            now_pd = pd.Timestamp(now)
             ctx = StrategyContext(
-                now=now.to_pydatetime(),
+                now=now_pd,
                 prices_15=prices_norm,
                 soc_total=float(soc.get('total', 0) or 0),
                 soc_per={b: float(soc.get(b, 0) or 0) for b in BATTERIES},
@@ -152,7 +157,7 @@ async def strategy_loop():
             except Exception:
                 pass
         except Exception as e:
-            logger.warning(f"Strategy loop error: {e}")
+            logger.exception("Strategy loop error")
         # loop continues; we'll align to next quarter at the top
 
 
@@ -161,6 +166,7 @@ async def strategy_loop():
 
 async def get_tibber():
     global measurement, tc, home
+    global tibber_connect_lock, last_tibber_attempt
 
     if len(measurement) > 1200*24:
         measurement = measurement[-1200*24:]
@@ -168,20 +174,81 @@ async def get_tibber():
     if home is not None and getattr(home, 'rt_subscription_running', False):
         return
 
-    # Establish once, minimal retry without closing
+    # Establish once, with exponential backoff on failures
+    backoff = 60  # start with 60s
+    max_backoff = 900  # cap at 15 minutes
+    # Create a lock lazily to prevent concurrent connect attempts
+    if 'tibber_connect_lock' not in globals() or tibber_connect_lock is None:
+        tibber_connect_lock = asyncio.Lock()
+
+    min_interval = 30.0  # seconds between attempts to avoid flood
+    if 'last_tibber_attempt' not in globals():
+        last_tibber_attempt = 0.0
+
     while True:
         try:
-            tc = tibber.Tibber(TIBBER_TOKEN, user_agent="SAX")
+            # Rate-limit attempts across restarts of this coroutine
+            now_m = time.monotonic()
+            elapsed = now_m - float(last_tibber_attempt or 0.0)
+            if elapsed < min_interval:
+                sleep_left = min_interval - elapsed
+                await asyncio.sleep(sleep_left)
+
+            async with tibber_connect_lock:
+                last_tibber_attempt = time.monotonic()
+            if not TIBBER_TOKEN:
+                raise RuntimeError("TIBBER_TOKEN is not set. Set it in config.py (TIBBER_TOKEN=...) or via environment and restart.")
+
+            logger.info(f'Connecting to Tibber with user_agent="{TIBBER_USER_AGENT}"')
+            tc = tibber.Tibber(TIBBER_TOKEN, user_agent=TIBBER_USER_AGENT)
             await tc.update_info()
-            home = tc.get_homes()[0]
+            homes = tc.get_homes()
+            if not homes:
+                raise RuntimeError("Tibber account has no homes associated with this token.")
+            home = homes[0]
             await home.rt_subscribe(lambda pkg: _callback(measurement, pkg))
-            await asyncio.sleep(5)
-            if home.rt_subscription_running:
+            # Give the subscription some time to flip the running flag
+            await asyncio.sleep(30)
+            if getattr(home, 'rt_subscription_running', False):
                 logger.info('Tibber realtime subscription started.')
+                backoff = 60
                 return
+            else:
+                # Trigger retry/backoff path handled below
+                raise RuntimeError('Tibber realtime subscription not running after subscribe call')
         except Exception as e:
-            logger.warning(f'Tibber setup failed, retrying in 120s: {e}')
-            await asyncio.sleep(120)
+            # Common pitfall: Tibber API returns text/plain when token is invalid or URL is wrong
+            msg = str(e)
+            if 'Unexpected content type: text/plain' in msg:
+                logger.error('Tibber auth/content-type error. This usually means your TIBBER_TOKEN is invalid or the API endpoint changed. '\
+                             'Please verify the token (Account -> Developer in Tibber app).')
+            # If we got rate limited (HTTP 429), back off more aggressively
+            if '429' in msg or 'Too Many Requests' in msg:
+                backoff = min(max_backoff, max(120, backoff * 2))
+                logger.warning(f'Tibber rate-limited (429). Backing off for {backoff}s')
+            else:
+                backoff = min(max_backoff, max(60, backoff * 2))
+                logger.warning(f'Tibber setup failed, will retry in {backoff}s: {e}')
+            # Best-effort: close any underlying aiohttp session to avoid warnings
+            try:
+                if tc is not None:
+                    for cand in ('close', 'close_connection', 'close_session'):
+                        fn = getattr(tc, cand, None)
+                        if callable(fn):
+                            res = fn()
+                            if inspect.isawaitable(res):
+                                await res
+                    sess = getattr(tc, 'session', None)
+                    if sess is not None:
+                        try:
+                            res = sess.close()
+                            if inspect.isawaitable(res):
+                                await res
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            await asyncio.sleep(backoff)
 
 
 async def update_price():
@@ -190,9 +257,57 @@ async def update_price():
 
     while True:
         try:
-            # Keep full horizon; normalize to 15-min tz-aware series
-            _price = pd.Series(home.price_total)
-            prices_series_15 = normalize_prices_15(_price)
+            # Wait until home is initialized
+            if home is None:
+                await asyncio.sleep(5)
+                continue
+
+            # Request 15-min prices when supported; fall back to hourly
+            res_used = "QUARTER_HOURLY"
+            try:
+                await home.update_price_info(resolution="QUARTER_HOURLY")
+            except Exception as e:
+                logger.debug(f"15-min prices not available, fallback to hourly: {e}")
+                await home.update_price_info(resolution="HOURLY")
+                res_used = "HOURLY"
+
+            # Extract price entries from Tibber price_info (today + tomorrow)
+            info = getattr(home, 'price_info', None)
+            entries = []
+            if info is not None:
+                for arr in [getattr(info, 'today', []) or [], getattr(info, 'tomorrow', []) or []]:
+                    for p in arr:
+                        try:
+                            ts_raw = getattr(p, 'startsAt', getattr(p, 'starts_at', None))
+                            ts = pd.to_datetime(ts_raw)
+                            if ts.tzinfo is None:
+                                ts = ts.tz_localize("UTC")
+                            ts = ts.tz_convert(ZoneInfo("Europe/Berlin"))
+                            val = float(getattr(p, 'total'))
+                            entries.append((ts, val))
+                        except Exception:
+                            pass
+
+            if entries:
+                s = pd.Series([v for (_, v) in entries], index=[t for (t, _) in entries]).sort_index()
+                # If we got hourly, upsample to 15-min with forward-fill
+                try:
+                    freq = pd.infer_freq(s.index)
+                except Exception:
+                    freq = None
+                if freq is None or freq.upper() not in ("15T", "15MIN"):
+                    s = s.resample("15min").ffill()
+                prices_series_15 = normalize_prices_15(s)
+            else:
+                # Fallback to legacy attribute if price_info missing
+                _price = pd.Series(getattr(home, 'price_total', []))
+                prices_series_15 = normalize_prices_15(_price)
+
+            logger.info(
+                "Price update done (resolution=%s, points=%s)",
+                res_used,
+                len(prices_series_15) if prices_series_15 is not None else 0,
+            )
         except Exception as e:
             prices_series_15 = None
             logger.warning(f'Price problems: {e}')
@@ -262,38 +377,80 @@ async def main():
     global soc
     global current_p, p_t
     global tc, home
+    global logger
     tc = None
     home = None
 
+    logger.info('Starting background tasks: update_soc, update_power, strategy_loop')
     asyncio.create_task(update_soc())
     asyncio.create_task(update_power())
     asyncio.create_task(strategy_loop())
         
-    logger = logging.getLogger('sax')
 
+    logger.info('Initializing Tibber realtime client...')
     await get_tibber()
     await asyncio.sleep(10)
+    logger.info('Starting price update task')
     asyncio.create_task(update_price())
     # Keep running indefinitely; strategy loop handles decisions every 15 min
-    await asyncio.Event().wait()
+    logger.info('Service started. Entering idle wait loop.')
+    # Heartbeat: log every 60s a small status
+    try:
+        while True:
+            try:
+                logger.info(
+                    "heartbeat soc_total=%.1f p_total=%s meas=%s tasks=ok",
+                    float(soc.get('total', 0) or 0),
+                    current_p.get('total', 'n/a'),
+                    len(measurement) if isinstance(measurement, list) else 'n/a',
+                )
+            except Exception:
+                logger.debug('heartbeat failed')
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info('Main loop cancelled, shutting down...')
+        pass
 
 # %%
 logger = logging.getLogger('sax')
-logger.setLevel('WARNING')
+# Allow overriding log level with env (e.g., SAX_LOG_LEVEL=DEBUG)
+_lvl = os.getenv('SAX_LOG_LEVEL', 'INFO').upper()
+try:
+    logger.setLevel(getattr(logging, _lvl, logging.INFO))
+except Exception:
+    logger.setLevel(logging.INFO)
 
+# Verbose format includes timestamp and module for journald and file
+formatter = logging.Formatter('%(asctime)s %(levelname)s [%(name)s:%(process)d] %(message)s')
+
+# Console (journald captures stdout/stderr from systemd)
 console = logging.StreamHandler()
-console.setLevel(level=logging.DEBUG)
-formatter =  logging.Formatter('%(levelname)s : %(message)s')
+console.setLevel(logging.INFO)
 console.setFormatter(formatter)
 logger.addHandler(console)
 
+# Rotating file in repo dir for easy tailing
 date = datetime.today().strftime('%Y-%m-%d')
 log_file = Path(__file__).with_name(f"steuerung_{date}.log")
 fileHandler = TimedRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=7, encoding="utf-8")
 fileHandler.setFormatter(formatter)
 logger.addHandler(fileHandler)
 
-logger.debug('test message')
+logger.info('SAX control starting up...')
+try:
+    eff_min, eff_max = get_effective_soc_limits()
+    masked_ips = {k: (v.rsplit('.', 1)[0] + '.x') for k, v in BATTERY_IPS.items()}
+    logger.info(
+        'startup batteries=%d ips=%s soc_window=%s power_limits=[%d..%d] log_level=%s',
+        N_BATTERIES,
+        masked_ips,
+        (eff_min, eff_max),
+        POWER_LIMIT_DISCHARGE_MIN_W,
+        POWER_LIMIT_CHARGE_MAX_W,
+        logging.getLevelName(logger.level),
+    )
+except Exception:
+    pass
 
 fleet: BatteryFleetController | None = None
 fast_ctrl: FastController | None = None
@@ -311,6 +468,10 @@ except Exception:
 
 #%%
 #await main()
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except Exception:
+    logging.getLogger('sax').exception('Fatal error in main')
+    raise
 #%%
 #systemd-run --unit=sax --collect python ~/sax/steuerung.py^

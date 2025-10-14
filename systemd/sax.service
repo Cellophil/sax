@@ -8,10 +8,14 @@ Wants=network-online.target
 Type=simple
 # Adjust ExecStart path to your Python and repository path on the target host
 # Example uses a venv in /home/<user>/sax/.venv
-Environment=TIBBER_TOKEN=
+EnvironmentFile=-/etc/sax/sax.env
+Environment=SAX_LOG_LEVEL=INFO
 Environment=PYTHONUNBUFFERED=1
-WorkingDirectory=/home/andreas/sax
-ExecStart=/home/andreas/sax/.venv/bin/python -m sax.steuerung
+Environment=PYTHONPATH=/home/andreas
+Environment=HOME=/home/andreas
+User=andreas
+WorkingDirectory=/home/andreas
+ExecStart=/bin/bash /home/andreas/sax/run_sax.sh
 Restart=always
 RestartSec=10
 # Optional: Limit resources, add nice/IOSchedulingPriority if desired

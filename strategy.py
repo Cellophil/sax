@@ -11,6 +11,9 @@ import pypsa
 from pathlib import Path
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
+import logging
+
+strategy_logger = logging.getLogger('sax.strategy')
 
 
 class Strategy(Enum):
@@ -147,7 +150,7 @@ def strategy_plot(ctx: StrategyContext, n: pypsa.Network, out_dir: Optional[str]
 
     # SOC in Wh; convert to percent based on capacity (p_nom [W] * max_hours [h])
     su = n.storage_units.loc["battery"]
-    capacity_wh = float(su.p_nom) * float(su.max_hours)
+    capacity_wh = float(su.p_nom) * float(su.max_hours) / 0.25
     soc_series_wh = n.storage_units_t.state_of_charge.loc[:, "battery"]
     soc_pct = (soc_series_wh / max(capacity_wh, 1e-9)) * 100.0
 
@@ -234,6 +237,25 @@ def decide_strategy(ctx: StrategyContext) -> Tuple[Strategy, Optional[int]]:
     ctx.pv_forecast_w.index = ctx.pv_forecast_w.index.tz_convert(ZoneInfo("UTC")).tz_localize(None)
     ctx.load_forecast_w.index = ctx.load_forecast_w.index.tz_convert(ZoneInfo("UTC")).tz_localize(None)
 
+    try:
+        s = ctx.prices_15
+        if s is not None and len(s) > 0:
+            summary = (
+                f"len={len(s)} window=[{s.index.min()} .. {s.index.max()}] "
+                f"min={float(s.min()):.3f} max={float(s.max()):.3f}"
+            )
+            head_txt = s.head(8).to_string()
+            strategy_logger.info('Prices (15min) %s\n%s', summary, head_txt)
+    except Exception as _e:
+        strategy_logger.debug('Price logging failed: %s', _e)
+    ctx.prices_15 = ctx.prices_15.fillna(0.30)
+
+    if ctx.soc_limit_lower >= ctx.soc_total:
+        ctx.soc_limit_lower = max(0.0, ctx.soc_total - 2.0)
+    if ctx.soc_limit_upper <= ctx.soc_total:
+        ctx.soc_limit_upper = min(100.0, ctx.soc_total + 2.0)
+    strategy_logger.info("Received SOC limits: %.1f .. %.1f %% (current %.1f %%)", ctx.soc_limit_lower, ctx.soc_limit_upper, ctx.soc_total)
+
     # set up a small pypsa optimization model to decide on strategy
     
     n = pypsa.Network()
@@ -252,43 +274,64 @@ def decide_strategy(ctx: StrategyContext) -> Tuple[Strategy, Optional[int]]:
 
     # Battery in Watts/Wh
     batt_p_nom_w = 6000.0  # 6 kW
-    batt_max_hours = 2.5 / 0.25 # 15 min intervals
+    batt_max_hours = 2.5 # 15 min intervals
     batt_capacity_wh = batt_p_nom_w * batt_max_hours
+    batt_capacity_wh_pypsa = batt_capacity_wh / 0.25  # PyPSA expects max_hours in hours relative to snapshot length (15min = 0.25h)
     n.add(
         "StorageUnit",
         "battery",
         bus="bus",
         p_nom=batt_p_nom_w,
-        max_hours=batt_max_hours,
+        max_hours=batt_max_hours / 0.25,  # PyPSA expects max_hours in hours relative to snapshot length (15min = 0.25h)
         efficiency_store=0.95,
         efficiency_dispatch=0.95,
-        state_of_charge_initial=(ctx.soc_total / 100.0) * batt_capacity_wh,
-        marginal_cost=0.02 / 1000 / 4,
+        state_of_charge_initial=(ctx.soc_total / 100.0) * batt_capacity_wh_pypsa,
+        marginal_cost=0,
     )
 
     # Grid generator; price must be €/Wh (prices were €/kWh)
     n.add("Generator", "grid", bus="bus", carrier="AC", p_nom=50000.0)
-    n.generators_t["marginal_cost"].loc[:, "grid"] = ctx.prices_15 / 1000.0 / 4
+    n.generators_t["marginal_cost"].loc[:, "grid"] = ctx.prices_15 / 1000.0
+
+    # Persist artifacts in the repository folder (next to this file)
+    base_dir = Path(__file__).resolve().parent
+    n.export_to_netcdf(str(base_dir / "plots/strategy_model_bfmodel.nc"))
 
     n.optimize.create_model()
 
-    # need to enter the soc limits as custom constraints
-    n.model.add_constraints(
-        n.model.variables['StorageUnit-state_of_charge'],
-        ">=",
-        (ctx.soc_limit_lower / 100.0) * batt_capacity_wh,
-        'battery_soc_min'
-    )
-    n.model.add_constraints(
-        n.model.variables['StorageUnit-state_of_charge'],
-        "<=",
-        (ctx.soc_limit_upper / 100.0) * batt_capacity_wh,
-        'battery_soc_max'
-    )
+    if False:
+        # Limits are unlikely to change battery behavior
+        # need to enter the soc limits as custom constraints
+        n.model.add_constraints(
+            n.model.variables['StorageUnit-state_of_charge'],
+            ">=",
+            (ctx.soc_limit_lower / 100.0) * batt_capacity_wh_pypsa,
+            'battery_soc_min'
+        )
+        strategy_logger.info("Battery SOC limits: %.1f .. %.1f %%", ctx.soc_limit_lower, ctx.soc_limit_upper)
+        n.model.add_constraints(
+            n.model.variables['StorageUnit-state_of_charge'],
+            "<=",
+            (ctx.soc_limit_upper / 100.0) * batt_capacity_wh_pypsa,
+            'battery_soc_max'
+        )
 
-    n.optimize.solve_model(solver_name="highs")
+    n.export_to_netcdf(str(base_dir / "plots/strategy_model.nc"))
 
-    print(n.storage_units_t['p'].loc[:, 'battery'])
+    n.optimize.solve_model(solver_name="highs", log_fn=str(base_dir / "plots/highs.log"))
+
+    n.export_to_netcdf(str(base_dir / "plots/strategy_model_solved.nc"))
+
+
+    try:
+        _su_p = n.storage_units_t['p']
+        if 'battery' not in _su_p.columns or _su_p.empty:
+            strategy_logger.warning("Optimization produced no 'battery' results; returning IDLE")
+            return Strategy.IDLE, 0
+        strategy_logger.debug("storage unit power head:\n%s", _su_p.head().to_string())
+    except Exception:
+        strategy_logger.warning("No storage unit results available; returning IDLE")
+        return Strategy.IDLE, 0
 
     # Save an interactive result plot for visibility
     strategy_plot(ctx, n)
@@ -298,7 +341,11 @@ def decide_strategy(ctx: StrategyContext) -> Tuple[Strategy, Optional[int]]:
         return Strategy.BALANCE, 0
     if n.storage_units_t['p'].loc[t[0], 'battery'] < -100:
         # are we charging above PV generation?
-        if -n.storage_units_t['p'].loc[t[0], 'battery'] >= n.generators_t['p'].loc[t[0], 'pv']+200:
+        try:
+            pv_now = float(n.generators_t['p'].loc[t[0], 'pv'])
+        except Exception:
+            pv_now = 0.0
+        if -n.storage_units_t['p'].loc[t[0], 'battery'] >= pv_now + 200:
             # yes, we are charging above PV generation
             # Convert W at the first snapshot to Wh over 15 minutes: Wh = W * 0.25h
             return Strategy.CHARGE, int(-n.storage_units_t['p'].loc[t[0], 'battery'] * 0.25)

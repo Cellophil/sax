@@ -28,7 +28,14 @@ SOC_MIN = 15
 SOC_MAX = 90
 
 # External integrations
-TIBBER_TOKEN = os.getenv('TIBBER_TOKEN', '')  # Prefer env var; keep empty if not provided
+# IMPORTANT: No fallback token. Provide TIBBER_TOKEN via environment (e.g. systemd EnvironmentFile)
+#_tok = os.getenv('TIBBER_TOKEN', '').strip()
+#TIBBER_TOKEN: Optional[str] = _tok if _tok else None
+TIBBER_TOKEN = 'VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU'
+
+# Tibber API user agent (some users report different behavior depending on UA).
+# Make it configurable; default to 'Andreas' as previously working value.
+TIBBER_USER_AGENT: str = (os.getenv('TIBBER_USER_AGENT', 'Andreas').strip() or 'Andreas')
 
 
 def get_effective_soc_limits(now: Optional[datetime] = None) -> Tuple[int, int]:
