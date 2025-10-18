@@ -7,7 +7,7 @@ import pandas as pd
 #%%
 
 async def start():
-  tibber_connection = tibber.Tibber('VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU', user_agent="change_this")
+  tibber_connection = tibber.Tibber('VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU', user_agent="Anton")
   await tibber_connection.update_info()
   print(tibber_connection.name)
 
@@ -44,15 +44,16 @@ async def run():
     await home.rt_subscribe(_callback)
 
     while True:
-      await asyncio.sleep(10)
+        
+        await asyncio.sleep(10)
 
 #%%
-tibber_connection = tibber.Tibber('VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU', user_agent="change_this")
+#tibber_connection = tibber.Tibber('VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU', user_agent="Anton")
 
 
 #%%
 
-loop = asyncio.run(run())
+await run()
 
 
 # %%

@@ -167,6 +167,7 @@ async def strategy_loop():
 async def get_tibber():
     global measurement, tc, home
     global tibber_connect_lock, last_tibber_attempt
+    global rt_msg_count, last_rt_message_ts
 
     if len(measurement) > 1200*24:
         measurement = measurement[-1200*24:]
@@ -199,18 +200,26 @@ async def get_tibber():
             if not TIBBER_TOKEN:
                 raise RuntimeError("TIBBER_TOKEN is not set. Set it in config.py (TIBBER_TOKEN=...) or via environment and restart.")
 
-            logger.info(f'Connecting to Tibber with user_agent="{TIBBER_USER_AGENT}"')
+            tibber_logger.info(f'Connecting to Tibber with user_agent="{TIBBER_USER_AGENT}"')
             tc = tibber.Tibber(TIBBER_TOKEN, user_agent=TIBBER_USER_AGENT)
             await tc.update_info()
             homes = tc.get_homes()
             if not homes:
                 raise RuntimeError("Tibber account has no homes associated with this token.")
             home = homes[0]
+            tibber_logger.info(f"Found {len(homes)} home(s); subscribing to realtime for the first home…")
+            # Reset counters before subscribe
+            rt_msg_count = 0
+            last_rt_message_ts = None
             await home.rt_subscribe(lambda pkg: _callback(measurement, pkg))
             # Give the subscription some time to flip the running flag
+            tibber_logger.info("Realtime subscribed; waiting up to 30s for running flag…")
             await asyncio.sleep(30)
-            if getattr(home, 'rt_subscription_running', False):
-                logger.info('Tibber realtime subscription started.')
+            running_flag = getattr(home, 'rt_subscription_running', False)
+            tibber_logger.info(f"rt_subscription_running={running_flag} msg_count={rt_msg_count} last_msg_ts={last_rt_message_ts}")
+            # Treat reception of any message as success, even if flag didn't flip
+            if running_flag or (rt_msg_count and rt_msg_count > 0):
+                tibber_logger.info('Tibber realtime subscription started.')
                 backoff = 60
                 return
             else:
@@ -220,15 +229,15 @@ async def get_tibber():
             # Common pitfall: Tibber API returns text/plain when token is invalid or URL is wrong
             msg = str(e)
             if 'Unexpected content type: text/plain' in msg:
-                logger.error('Tibber auth/content-type error. This usually means your TIBBER_TOKEN is invalid or the API endpoint changed. '\
+                tibber_logger.error('Tibber auth/content-type error. This usually means your TIBBER_TOKEN is invalid or the API endpoint changed. '\
                              'Please verify the token (Account -> Developer in Tibber app).')
             # If we got rate limited (HTTP 429), back off more aggressively
             if '429' in msg or 'Too Many Requests' in msg:
                 backoff = min(max_backoff, max(120, backoff * 2))
-                logger.warning(f'Tibber rate-limited (429). Backing off for {backoff}s')
+                tibber_logger.warning(f'Tibber rate-limited (429). Backing off for {backoff}s')
             else:
                 backoff = min(max_backoff, max(60, backoff * 2))
-                logger.warning(f'Tibber setup failed, will retry in {backoff}s: {e}')
+                tibber_logger.warning(f'Tibber setup failed, will retry in {backoff}s: {e}')
             # Best-effort: close any underlying aiohttp session to avoid warnings
             try:
                 if tc is not None:
@@ -267,7 +276,7 @@ async def update_price():
             try:
                 await home.update_price_info(resolution="QUARTER_HOURLY")
             except Exception as e:
-                logger.debug(f"15-min prices not available, fallback to hourly: {e}")
+                tibber_logger.info(f"15-min prices not available, fallback to hourly: {e}")
                 await home.update_price_info(resolution="HOURLY")
                 res_used = "HOURLY"
 
@@ -303,14 +312,14 @@ async def update_price():
                 _price = pd.Series(getattr(home, 'price_total', []))
                 prices_series_15 = normalize_prices_15(_price)
 
-            logger.info(
+            tibber_logger.info(
                 "Price update done (resolution=%s, points=%s)",
                 res_used,
                 len(prices_series_15) if prices_series_15 is not None else 0,
             )
         except Exception as e:
             prices_series_15 = None
-            logger.warning(f'Price problems: {e}')
+            tibber_logger.warning(f'Price problems: {e}')
 
         # Tibber updates at most hourly; 5 minutes poll is fine
         await asyncio.sleep(300)
@@ -345,9 +354,16 @@ def get_robust_reading(N=10, which='last'):
 
 
 def _callback(collect, pkg):
+    global rt_msg_count, last_rt_message_ts
     data = pkg.get("data")
     if data is None:
         return
+    # Track that we saw a realtime message
+    try:
+        last_rt_message_ts = datetime.now(ZoneInfo("Europe/Berlin"))
+        rt_msg_count = (rt_msg_count or 0) + 1
+    except Exception:
+        pass
     collect.append(
         (pd.to_datetime(data.get("liveMeasurement")['timestamp']), data.get("liveMeasurement")['power'] -data.get("liveMeasurement")["powerProduction"])
     )
@@ -387,10 +403,10 @@ async def main():
     asyncio.create_task(strategy_loop())
         
 
-    logger.info('Initializing Tibber realtime client...')
+    tibber_logger.info('Initializing Tibber realtime client...')
     await get_tibber()
     await asyncio.sleep(10)
-    logger.info('Starting price update task')
+    tibber_logger.info('Starting price update task')
     asyncio.create_task(update_price())
     # Keep running indefinitely; strategy loop handles decisions every 15 min
     logger.info('Service started. Entering idle wait loop.')
@@ -465,6 +481,10 @@ try:
     strategy_logger.addHandler(s_file)
 except Exception:
     pass
+
+# Dedicated Tibber logger (inherits handlers from 'sax' so it logs to the same files/console)
+tibber_logger = logging.getLogger('sax.tibber')
+tibber_logger.setLevel(logging.INFO)
 
 #%%
 #await main()

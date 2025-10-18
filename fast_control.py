@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Callable
 from zoneinfo import ZoneInfo
 from datetime import datetime
+import logging
 
 # This module implements a fast control loop that runs every ~3 seconds,
 # adjusting the total setpoint to keep net import/export near zero depending on
@@ -50,6 +51,7 @@ class FastControlConfig:
 
 class FastController:
     def __init__(self, fleet: BatteryFleetController, cfg: Optional[FastControlConfig] = None):
+        self.logger = logging.getLogger('sax.fast')
         self.fleet = fleet
         # Apply defaults from config, then override with provided cfg
         base = FastControlConfig()
@@ -76,6 +78,10 @@ class FastController:
         self._remaining_energy_Wh = 0.0
         self._interval_end = None
         self._last_ts = None
+        # Heartbeat & measurement staleness
+        self._last_heartbeat = None
+        self._meas_prev: Optional[float] = None
+        self._meas_still_since: Optional[datetime] = None
 
     def set_mode(
         self,
@@ -152,6 +158,18 @@ class FastController:
             # Timestamp and filtered signal
             now_ts = datetime.now(ZoneInfo("Europe/Berlin"))
             raw = float(measured_net or 0.0)
+            # Track measurement staleness (no change over time)
+            if self._meas_prev is None:
+                self._meas_prev = raw
+                self._meas_still_since = now_ts
+            else:
+                if abs(raw - self._meas_prev) < 1.0:
+                    # essentially unchanged
+                    if self._meas_still_since is None:
+                        self._meas_still_since = now_ts
+                else:
+                    self._meas_prev = raw
+                    self._meas_still_since = None
             if self._ema_net is None:
                 self._ema_net = raw
 
@@ -181,6 +199,7 @@ class FastController:
                 self._passive_until = now_ts + timedelta(seconds=self.cfg.passive_cooldown_s)
                 in_passive = True
                 self._pulse_hits.clear()
+                self.logger.info("fast: spike detected → entering passive for %.0fs", self.cfg.pulse_cooldown_s if hasattr(self.cfg, 'pulse_cooldown_s') else self.cfg.passive_cooldown_s)
 
             # Tolerances and step sizes
             if in_passive:
@@ -242,4 +261,31 @@ class FastController:
                     self._interval_end = None
 
             self._last_ts = now_ts
+
+            # Heartbeat every ~30s with useful context
+            try:
+                if self._last_heartbeat is None:
+                    self._last_heartbeat = now_ts
+                hb_dt = (now_ts - self._last_heartbeat).total_seconds()
+                if hb_dt >= 30.0:
+                    stale_s = (now_ts - self._meas_still_since).total_seconds() if self._meas_still_since else 0.0
+                    self.logger.info(
+                        "fast hb mode=%s aggr=%s passive=%s tol=%d max_step=%d raw=%.1f ema=%.1f desired=%d batt=%d pulses(win=%d hits=%d consec=%d) meas_stale_s=%.0f",
+                        self._mode,
+                        self._aggressive,
+                        in_passive,
+                        (self.cfg.tol_passive_w if in_passive else (self.cfg.tol_aggressive_w if self._aggressive else self.cfg.tol_normal_w)),
+                        (self.cfg.max_step_passive_w if in_passive else self.cfg.max_step_w),
+                        raw,
+                        self._ema_net,
+                        desired,
+                        batt_total_w,
+                        self.cfg.pulse_detect_window,
+                        sum(self._pulse_hits),
+                        consec,
+                        stale_s,
+                    )
+                    self._last_heartbeat = now_ts
+            except Exception:
+                pass
             await asyncio.sleep(self.cfg.sample_period_s)
