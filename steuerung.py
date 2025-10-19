@@ -24,6 +24,7 @@ try:
     from .controller import BatteryFleetController
     from .strategy import Strategy, StrategyContext, decide_strategy, normalize_prices_15
     from .fast_control import FastController, FastControlConfig
+    from .tibber_ws import TibberWSClient
 except ImportError:
     from config import (
         BATTERY_IPS, BATTERIES, N_BATTERIES,
@@ -34,10 +35,139 @@ except ImportError:
     from controller import BatteryFleetController
     from strategy import Strategy, StrategyContext, decide_strategy, normalize_prices_15
     from fast_control import FastController, FastControlConfig
+    from tibber_ws import TibberWSClient
 
 #%%
 
 N_battery = N_BATTERIES
+
+async def tibber_check_realtime_capability(token: str, home_id: str | None = None) -> dict:
+    """Query Tibber GraphQL features for realtime capability.
+
+    Returns a dict with enabled/supported flags for homes and logs details.
+    """
+    url = "https://api.tibber.com/v1-beta/gql"
+    query = {
+        "query": (
+            "query ViewerHomesFeatures {\n"
+            "  viewer { homes { id appNickname: appNickname features { realTimeConsumptionEnabled } } }\n"
+            "}"
+        )
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": str(TIBBER_USER_AGENT or "sax")
+    }
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(url, json=query, headers=headers, timeout=20) as resp:
+                data = await resp.json(content_type=None)
+        homes = (((data or {}).get("data") or {}).get("viewer") or {}).get("homes") or []
+        if not homes:
+            tibber_logger.info("GraphQL feature check returned no homes")
+            return {"homes": []}
+        # Prefer matching home_id if provided
+        chosen = None
+        if home_id:
+            for h in homes:
+                if str(h.get("id")) == str(home_id):
+                    chosen = h
+                    break
+        if chosen is None:
+            chosen = homes[0]
+        feats = (chosen.get("features") or {})
+        enabled = bool(feats.get("realTimeConsumptionEnabled", False))
+        tibber_logger.info(
+            "Realtime capability (home id=%s nick=%s): enabled=%s",
+            chosen.get("id"), chosen.get("appNickname"), enabled,
+        )
+        if not enabled:
+            tibber_logger.warning("Realtime not enabled according to API; subscription may stay silent.")
+        return {"homes": homes, "chosen": chosen, "enabled": enabled}
+    except Exception as e:
+        tibber_logger.warning(f"GraphQL feature check failed: {e}")
+        return {"error": str(e)}
+
+
+async def tibber_fetch_ws_url_and_home(token: str) -> tuple[str | None, str | None, bool | None]:
+    """Fetch viewer.websocketSubscriptionUrl and find an enabled home id.
+
+    Returns (ws_url, home_id, enabled) where enabled is the feature flag for that home.
+    """
+    url = "https://api.tibber.com/v1-beta/gql"
+    query = {
+        "query": (
+            "query ViewerWS {\n"
+            "  viewer {\n"
+            "    websocketSubscriptionUrl\n"
+            "    homes { id appNickname: appNickname features { realTimeConsumptionEnabled } }\n"
+            "  }\n"
+            "}"
+        ),
+        "variables": {},
+    }
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": str(TIBBER_USER_AGENT or "sax"),
+    }
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(url, json=query, headers=headers, timeout=20) as resp:
+                data = await resp.json(content_type=None)
+        viewer = (((data or {}).get("data") or {}).get("viewer") or {})
+        ws_url = viewer.get("websocketSubscriptionUrl")
+        homes = viewer.get("homes") or []
+        chosen = None
+        for h in homes:
+            feats = (h.get("features") or {})
+            if feats.get("realTimeConsumptionEnabled"):
+                chosen = h
+                break
+        if chosen is None and homes:
+            chosen = homes[0]
+        hid = chosen.get("id") if chosen else None
+        enabled = (chosen.get("features") or {}).get("realTimeConsumptionEnabled") if chosen else None
+        return ws_url, hid, enabled
+    except Exception as e:
+        tibber_logger.info(f"Viewer websocketSubscriptionUrl query (direct HTTP) failed: {e}")
+        return None, None, None
+
+
+async def tibber_check_realtime_capability_via_tc(tc_obj, home_id: str | None = None) -> dict:
+    """Same as tibber_check_realtime_capability but using pyTibber's execute (shared session/headers)."""
+    query = (
+        "query ViewerHomesFeatures {\n"
+        "  viewer { homes { id appNickname: appNickname features { realTimeConsumptionEnabled } } }\n"
+        "}"
+    )
+    try:
+        data = await tc_obj.execute(query)
+        homes = (((data or {}).get("data") or {}).get("viewer") or {}).get("homes") or []
+        if not homes:
+            tibber_logger.info("GraphQL feature check (tc) returned no homes")
+            return {"homes": []}
+        chosen = None
+        if home_id:
+            for h in homes:
+                if str(h.get("id")) == str(home_id):
+                    chosen = h
+                    break
+        if chosen is None:
+            chosen = homes[0]
+        feats = (chosen.get("features") or {})
+        enabled = bool(feats.get("realTimeConsumptionEnabled", False))
+        tibber_logger.info(
+            "Realtime capability (home id=%s nick=%s): enabled=%s",
+            chosen.get("id"), chosen.get("appNickname"), enabled,
+        )
+        if not enabled:
+            tibber_logger.warning("Realtime not enabled according to API; subscription may stay silent.")
+        return {"homes": homes, "chosen": chosen, "enabled": enabled}
+    except Exception as e:
+        tibber_logger.warning(f"GraphQL feature check via tc failed: {e}")
+        return {"error": str(e)}
 
 async def update_soc():
     global soc, fleet
@@ -94,15 +224,22 @@ async def strategy_loop():
     Runs every few minutes, consuming 15-min price series, SOC, and current power.
     """
     global soc, current_p, prices_series_15, fast_ctrl, fleet
+    first_run = True
     while True:
         try:
-            # Align to quarter-hour boundaries
-            now = pd.Timestamp.now(tz=ZoneInfo("Europe/Berlin"))
-            next_q = now.ceil("15min")
-            sleep_s = max(0.0, (next_q - now).total_seconds())
-            await asyncio.sleep(sleep_s)
+            # First run immediately, then align to quarter-hour boundaries
+            if not first_run:
+                now = pd.Timestamp.now(tz=ZoneInfo("Europe/Berlin"))
+                next_q = now.ceil("15min")
+                sleep_s = max(0.0, (next_q - now).total_seconds())
+                await asyncio.sleep(sleep_s)
+            else:
+                first_run = False
 
             now = pd.Timestamp.now(tz=ZoneInfo("Europe/Berlin"))
+            # On first run, give prices task up to 2 seconds to populate
+            if first_run and (('prices_series_15' not in globals()) or prices_series_15 is None):
+                await asyncio.sleep(2)
             prices_norm = normalize_prices_15(prices_series_15 if 'prices_series_15' in globals() else None)
             # Ensure ctx.now is a pandas.Timestamp so .floor works reliably
             now_pd = pd.Timestamp(now)
@@ -168,12 +305,13 @@ async def get_tibber():
     global measurement, tc, home
     global tibber_connect_lock, last_tibber_attempt
     global rt_msg_count, last_rt_message_ts
+    global tibber_session
+    global tibber_ws_client
+    global tibber_home_id
 
     if len(measurement) > 1200*24:
         measurement = measurement[-1200*24:]
-    # Already subscribed and running? Nothing to do.
-    if home is not None and getattr(home, 'rt_subscription_running', False):
-        return
+    # We will use raw WS directly; ignore pyTibber realtime state
 
     # Establish once, with exponential backoff on failures
     backoff = 60  # start with 60s
@@ -201,30 +339,103 @@ async def get_tibber():
                 raise RuntimeError("TIBBER_TOKEN is not set. Set it in config.py (TIBBER_TOKEN=...) or via environment and restart.")
 
             tibber_logger.info(f'Connecting to Tibber with user_agent="{TIBBER_USER_AGENT}"')
-            tc = tibber.Tibber(TIBBER_TOKEN, user_agent=TIBBER_USER_AGENT)
-            await tc.update_info()
-            homes = tc.get_homes()
-            if not homes:
-                raise RuntimeError("Tibber account has no homes associated with this token.")
-            home = homes[0]
-            tibber_logger.info(f"Found {len(homes)} home(s); subscribing to realtime for the first home…")
-            # Reset counters before subscribe
+            # Maintain a persistent aiohttp session across retries to avoid 'Session is closed'
+            try:
+                if 'tibber_session' not in globals() or tibber_session is None or tibber_session.closed:
+                    tibber_session = aiohttp.ClientSession()
+            except Exception:
+                tibber_session = None
+            # Use raw GraphQL WS directly
+            # 1) Determine WS URL and home id (prefer enabled home)
+            # Try via pyTibber execute first for consistency
+            tc = tibber.Tibber(TIBBER_TOKEN, user_agent=TIBBER_USER_AGENT, websession=tibber_session)
+            ws_url = None
+            hid = None
+            try:
+                gql = (
+                    "query ViewerWS {\n"
+                    "  viewer {\n"
+                    "    websocketSubscriptionUrl\n"
+                    "    homes { id features { realTimeConsumptionEnabled } }\n"
+                    "  }\n"
+                    "}"
+                )
+                data = await tc.execute(gql)
+                viewer = (data or {}).get("data", {}).get("viewer", {})
+                ws_url = viewer.get("websocketSubscriptionUrl")
+                homes_v = viewer.get("homes") or []
+                chosen = None
+                for h in homes_v:
+                    feats = (h.get("features") or {})
+                    if feats.get("realTimeConsumptionEnabled"):
+                        chosen = h
+                        break
+                if chosen is None and homes_v:
+                    chosen = homes_v[0]
+                hid = chosen.get("id") if chosen else None
+            except Exception:
+                pass
+            if not ws_url or not hid:
+                ws_url2, hid2, enabled2 = await tibber_fetch_ws_url_and_home(TIBBER_TOKEN)
+                ws_url = ws_url or ws_url2
+                hid = hid or hid2
+                if enabled2 is False:
+                    tibber_logger.warning("Realtime disabled according to viewer query; stream may be silent.")
+            if not hid:
+                raise RuntimeError("Could not determine Tibber home id for realtime subscription")
+            if not ws_url:
+                raise RuntimeError("viewer.websocketSubscriptionUrl missing; cannot start realtime without dynamic URL")
+            tibber_logger.info(f"Using Tibber websocketSubscriptionUrl={ws_url}")
+
+            # Remember home id for price updates
+            tibber_home_id = str(hid)
+
+            # Initialize `home` for price updates via pyTibber (realtime handled separately)
+            try:
+                await tc.update_info()
+                homes_list = tc.get_homes() or []
+                chosen_home = None
+                for h in homes_list:
+                    try:
+                        h_id = getattr(h, 'id', getattr(h, 'home_id', None))
+                        if str(h_id) == str(hid):
+                            chosen_home = h
+                            break
+                    except Exception:
+                        continue
+                if chosen_home is None and homes_list:
+                    chosen_home = homes_list[0]
+                if chosen_home is not None:
+                    globals()['home'] = chosen_home
+            except Exception as e_init_home:
+                tibber_logger.info(f"Could not initialize Tibber home for price updates yet: {e_init_home}")
+
+            # 2) Start WS client
+            tibber_logger.info("Starting raw GraphQL WS client…")
             rt_msg_count = 0
             last_rt_message_ts = None
-            await home.rt_subscribe(lambda pkg: _callback(measurement, pkg))
-            # Give the subscription some time to flip the running flag
-            tibber_logger.info("Realtime subscribed; waiting up to 30s for running flag…")
-            await asyncio.sleep(30)
-            running_flag = getattr(home, 'rt_subscription_running', False)
-            tibber_logger.info(f"rt_subscription_running={running_flag} msg_count={rt_msg_count} last_msg_ts={last_rt_message_ts}")
-            # Treat reception of any message as success, even if flag didn't flip
-            if running_flag or (rt_msg_count and rt_msg_count > 0):
-                tibber_logger.info('Tibber realtime subscription started.')
+            tibber_ws_client = TibberWSClient(
+                TIBBER_TOKEN,
+                str(hid),
+                session=tibber_session,
+                logger=tibber_logger,
+                prefer_legacy=False,
+                user_agent=TIBBER_USER_AGENT,
+                ws_url=ws_url,
+            )
+            await tibber_ws_client.start(lambda pkg: _callback(measurement, pkg))
+            await asyncio.sleep(45)
+            tibber_logger.info(f"raw_ws running={tibber_ws_client.running} msg_count={rt_msg_count} last_msg_ts={last_rt_message_ts}")
+            if tibber_ws_client.running and (rt_msg_count and rt_msg_count > 0):
+                tibber_logger.info('Raw GraphQL websocket subscription started.')
                 backoff = 60
                 return
             else:
-                # Trigger retry/backoff path handled below
-                raise RuntimeError('Tibber realtime subscription not running after subscribe call')
+                try:
+                    await tibber_ws_client.stop()
+                except Exception:
+                    pass
+                raise RuntimeError('Raw GraphQL websocket silent; will back off and retry')
         except Exception as e:
             # Common pitfall: Tibber API returns text/plain when token is invalid or URL is wrong
             msg = str(e)
@@ -232,71 +443,89 @@ async def get_tibber():
                 tibber_logger.error('Tibber auth/content-type error. This usually means your TIBBER_TOKEN is invalid or the API endpoint changed. '\
                              'Please verify the token (Account -> Developer in Tibber app).')
             # If we got rate limited (HTTP 429), back off more aggressively
-            if '429' in msg or 'Too Many Requests' in msg:
-                backoff = min(max_backoff, max(120, backoff * 2))
-                tibber_logger.warning(f'Tibber rate-limited (429). Backing off for {backoff}s')
+            if '429' in msg or 'Too Many Requests' in msg or 'rate limit' in msg.lower():
+                backoff = min(max_backoff, max(120, int(backoff * 1.7)))
+                tibber_logger.warning(f'Tibber rate-limited or connection allowance reached. Backing off for {backoff}s')
             else:
-                backoff = min(max_backoff, max(60, backoff * 2))
+                backoff = min(max_backoff, max(60, int(backoff * 1.4)))
                 tibber_logger.warning(f'Tibber setup failed, will retry in {backoff}s: {e}')
-            # Best-effort: close any underlying aiohttp session to avoid warnings
-            try:
-                if tc is not None:
-                    for cand in ('close', 'close_connection', 'close_session'):
-                        fn = getattr(tc, cand, None)
-                        if callable(fn):
-                            res = fn()
-                            if inspect.isawaitable(res):
-                                await res
-                    sess = getattr(tc, 'session', None)
-                    if sess is not None:
-                        try:
-                            res = sess.close()
-                            if inspect.isawaitable(res):
-                                await res
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            await asyncio.sleep(backoff)
+            # Do not close shared session here
+            # add jitter +/- 20% to spread reconnects
+            jitter = 0.2 * backoff
+            sleep_for = max(15, backoff + np.random.uniform(-jitter, jitter))
+            await asyncio.sleep(sleep_for)
 
 
 async def update_price():
-    global home, prices_series_15
+    global prices_series_15, tibber_home_id
     prices_series_15 = None
 
     while True:
         try:
-            # Wait until home is initialized
-            if home is None:
+            # Wait until home id is initialized
+            if 'tibber_home_id' not in globals() or not tibber_home_id:
                 await asyncio.sleep(5)
                 continue
 
-            # Request 15-min prices when supported; fall back to hourly
-            res_used = "QUARTER_HOURLY"
-            try:
-                await home.update_price_info(resolution="QUARTER_HOURLY")
-            except Exception as e:
-                tibber_logger.info(f"15-min prices not available, fallback to hourly: {e}")
-                await home.update_price_info(resolution="HOURLY")
-                res_used = "HOURLY"
-
-            # Extract price entries from Tibber price_info (today + tomorrow)
-            info = getattr(home, 'price_info', None)
-            entries = []
-            if info is not None:
-                for arr in [getattr(info, 'today', []) or [], getattr(info, 'tomorrow', []) or []]:
-                    for p in arr:
+            # Fetch price info via GraphQL HTTP directly
+            async def _fetch_prices(resolution: str):
+                gql = (
+                    "query Price($homeId: ID!, $res: PriceInfoResolution!) {\n"
+                    "  viewer {\n"
+                    "    home(id: $homeId) {\n"
+                    "      currentSubscription {\n"
+                    "        priceInfo(resolution: $res) {\n"
+                    "          today { total startsAt }\n"
+                    "          tomorrow { total startsAt }\n"
+                    "        }\n"
+                    "      }\n"
+                    "    }\n"
+                    "  }\n"
+                    "}"
+                )
+                headers = {
+                    "Authorization": f"Bearer {TIBBER_TOKEN}",
+                    "Content-Type": "application/json",
+                    "User-Agent": str(TIBBER_USER_AGENT or "sax"),
+                }
+                payload = {"query": gql, "variables": {"homeId": tibber_home_id, "res": resolution}}
+                sess = tibber_session if ('tibber_session' in globals() and tibber_session and not tibber_session.closed) else aiohttp.ClientSession()
+                owns = sess is not tibber_session
+                try:
+                    async with sess.post("https://api.tibber.com/v1-beta/gql", json=payload, headers=headers, timeout=20) as resp:
+                        data = await resp.json(content_type=None)
+                    if not data or 'errors' in data:
+                        raise RuntimeError(str(data.get('errors'))) if isinstance(data, dict) else RuntimeError("GraphQL error")
+                    vi = (((data or {}).get("data") or {}).get("viewer") or {}).get("home") or {}
+                    sub = (vi.get("currentSubscription") or {}).get("priceInfo") or {}
+                    today = sub.get("today") or []
+                    tomorrow = sub.get("tomorrow") or []
+                    items = today + tomorrow
+                    entries = []
+                    for p in items:
                         try:
-                            ts_raw = getattr(p, 'startsAt', getattr(p, 'starts_at', None))
-                            ts = pd.to_datetime(ts_raw)
+                            ts = pd.to_datetime(p.get("startsAt"))
                             if ts.tzinfo is None:
                                 ts = ts.tz_localize("UTC")
                             ts = ts.tz_convert(ZoneInfo("Europe/Berlin"))
-                            val = float(getattr(p, 'total'))
+                            val = float(p.get("total"))
                             entries.append((ts, val))
                         except Exception:
-                            pass
+                            continue
+                    return entries
+                finally:
+                    if owns:
+                        await sess.close()
 
+            res_used = "QUARTER_HOURLY"
+            entries = []
+            try:
+                entries = await _fetch_prices("QUARTER_HOURLY")
+            except Exception as e_qh:
+                tibber_logger.warning(f"15-min price fetch failed; leaving prices unset: {e_qh}")
+                entries = []
+
+            s = None
             if entries:
                 s = pd.Series([v for (_, v) in entries], index=[t for (t, _) in entries]).sort_index()
                 # If we got hourly, upsample to 15-min with forward-fill
@@ -308,9 +537,7 @@ async def update_price():
                     s = s.resample("15min").ffill()
                 prices_series_15 = normalize_prices_15(s)
             else:
-                # Fallback to legacy attribute if price_info missing
-                _price = pd.Series(getattr(home, 'price_total', []))
-                prices_series_15 = normalize_prices_15(_price)
+                prices_series_15 = None
 
             tibber_logger.info(
                 "Price update done (resolution=%s, points=%s)",
@@ -388,6 +615,9 @@ current_p = {
 }
 p_t = []
 
+# Shared aiohttp session for Tibber to prevent 'Session is closed' during watchdog/resubscribe
+tibber_session: aiohttp.ClientSession | None = None
+
 async def main():
     global measurement
     global soc
@@ -405,9 +635,10 @@ async def main():
 
     tibber_logger.info('Initializing Tibber realtime client...')
     await get_tibber()
-    await asyncio.sleep(10)
+    # Start price task right away after realtime is up
     tibber_logger.info('Starting price update task')
     asyncio.create_task(update_price())
+    await asyncio.sleep(3)
     # Keep running indefinitely; strategy loop handles decisions every 15 min
     logger.info('Service started. Entering idle wait loop.')
     # Heartbeat: log every 60s a small status

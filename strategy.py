@@ -237,15 +237,15 @@ def decide_strategy(ctx: StrategyContext) -> Tuple[Strategy, Optional[int]]:
     ctx.pv_forecast_w.index = ctx.pv_forecast_w.index.tz_convert(ZoneInfo("UTC")).tz_localize(None)
     ctx.load_forecast_w.index = ctx.load_forecast_w.index.tz_convert(ZoneInfo("UTC")).tz_localize(None)
 
+    # Optionally log a compact price summary (disabled noisy head listing)
     try:
         s = ctx.prices_15
         if s is not None and len(s) > 0:
             summary = (
-                f"len={len(s)} window=[{s.index.min()} .. {s.index.max()}] "
+                f"prices: len={len(s)} window=[{s.index.min()} .. {s.index.max()}] "
                 f"min={float(s.min()):.3f} max={float(s.max()):.3f}"
             )
-            head_txt = s.head(8).to_string()
-            strategy_logger.info('Prices (15min) %s\n%s', summary, head_txt)
+            strategy_logger.info('%s', summary)
     except Exception as _e:
         strategy_logger.debug('Price logging failed: %s', _e)
     ctx.prices_15 = ctx.prices_15.fillna(0.30)

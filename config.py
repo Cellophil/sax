@@ -31,7 +31,7 @@ SOC_MAX = 90
 # IMPORTANT: No fallback token. Provide TIBBER_TOKEN via environment (e.g. systemd EnvironmentFile)
 #_tok = os.getenv('TIBBER_TOKEN', '').strip()
 #TIBBER_TOKEN: Optional[str] = _tok if _tok else None
-TIBBER_TOKEN = 'VlMXTgqKRqgY2ZYdai-WzKZ4h8Go1FbdIj-RqRffYjU'
+TIBBER_TOKEN = 'EEE07436AD7347807083C7321542A3DA1CDF197D22A7424210F7FAA8F52029C8-1'
 
 # Tibber API user agent (some users report different behavior depending on UA).
 # Make it configurable; default to 'Andreas' as previously working value.
