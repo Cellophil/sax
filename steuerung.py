@@ -308,6 +308,7 @@ async def get_tibber():
     global tibber_session
     global tibber_ws_client
     global tibber_home_id
+    global tibber_ws_url
 
     if len(measurement) > 1200*24:
         measurement = measurement[-1200*24:]
@@ -386,6 +387,7 @@ async def get_tibber():
             if not ws_url:
                 raise RuntimeError("viewer.websocketSubscriptionUrl missing; cannot start realtime without dynamic URL")
             tibber_logger.info(f"Using Tibber websocketSubscriptionUrl={ws_url}")
+            tibber_ws_url = ws_url
 
             # Remember home id for price updates
             tibber_home_id = str(hid)
@@ -454,6 +456,58 @@ async def get_tibber():
             jitter = 0.2 * backoff
             sleep_for = max(15, backoff + np.random.uniform(-jitter, jitter))
             await asyncio.sleep(sleep_for)
+
+
+async def tibber_watchdog():
+    """Monitor realtime freshness and reconnect on staleness or client stop.
+
+    Conditions to reconnect:
+      - No message received for STALE_SEC seconds, or
+      - Client not running.
+    Uses tibber_connect_lock to serialize reconnect attempts.
+    """
+    global last_rt_message_ts, tibber_ws_client
+    global tibber_connect_lock
+    # thresholds (seconds), overridable by env
+    try:
+        STALE_SEC = int(os.getenv('SAX_TIBBER_STALE_SEC', '75'))
+    except Exception:
+        STALE_SEC = 75
+    min_interval = 45.0
+    last_attempt = 0.0
+    while True:
+        try:
+            now = datetime.now(ZoneInfo("Europe/Berlin"))
+            age = None
+            if last_rt_message_ts is not None:
+                age = (now - last_rt_message_ts).total_seconds()
+            stale = (age is None) or (age > STALE_SEC)
+            stopped = (tibber_ws_client is None) or (not getattr(tibber_ws_client, 'running', False))
+            if stale or stopped:
+                # avoid reconnect storms
+                if (time.monotonic() - last_attempt) < min_interval:
+                    await asyncio.sleep(5)
+                else:
+                    last_attempt = time.monotonic()
+                    tibber_logger.warning(f"Tibber realtime stale (age={age}) or stopped={stopped}; reconnecting…")
+                    # Stop existing client if any
+                    try:
+                        if tibber_ws_client is not None:
+                            await tibber_ws_client.stop()
+                    except Exception:
+                        pass
+                    # Re-run setup; will block until running
+                    try:
+                        await get_tibber()
+                        # on success, reset attempt timer
+                        last_attempt = time.monotonic()
+                    except Exception as e:
+                        tibber_logger.warning(f"Watchdog reconnect failed: {e}")
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(10)
 
 
 async def update_price():
@@ -639,17 +693,33 @@ async def main():
     tibber_logger.info('Starting price update task')
     asyncio.create_task(update_price())
     await asyncio.sleep(3)
+    # Start Tibber watchdog for stale/stop auto-reconnect
+    asyncio.create_task(tibber_watchdog())
     # Keep running indefinitely; strategy loop handles decisions every 15 min
     logger.info('Service started. Entering idle wait loop.')
     # Heartbeat: log every 60s a small status
     try:
         while True:
             try:
+                # Derive latest net power with same sign convention as fast control (positive = export)
+                try:
+                    _, last_raw = get_robust_reading(N=8, which='last')
+                    net_w = -float(last_raw)
+                except Exception:
+                    net_w = 'n/a'
+                # Snapshot of fast controller if present
+                fc_mode = getattr(fast_ctrl, 'last_mode', '-') if 'fast_ctrl' in globals() and fast_ctrl else '-'
+                fc_desired = getattr(fast_ctrl, 'last_desired_w', '-') if 'fast_ctrl' in globals() and fast_ctrl else '-'
+                fc_ema = getattr(fast_ctrl, 'last_ema_w', '-') if 'fast_ctrl' in globals() and fast_ctrl else '-'
                 logger.info(
-                    "heartbeat soc_total=%.1f p_total=%s meas=%s tasks=ok",
+                    "heartbeat soc_total=%.1f p_total=%s net_w=%s meas_count=%s fast={mode=%s desired=%s ema=%.1f}",
                     float(soc.get('total', 0) or 0),
                     current_p.get('total', 'n/a'),
+                    net_w,
                     len(measurement) if isinstance(measurement, list) else 'n/a',
+                    fc_mode,
+                    fc_desired,
+                    float(fc_ema) if isinstance(fc_ema, (int, float)) else float('nan'),
                 )
             except Exception:
                 logger.debug('heartbeat failed')
@@ -676,9 +746,8 @@ console.setLevel(logging.INFO)
 console.setFormatter(formatter)
 logger.addHandler(console)
 
-# Rotating file in repo dir for easy tailing
-date = datetime.today().strftime('%Y-%m-%d')
-log_file = Path(__file__).with_name(f"steuerung_{date}.log")
+# Rotating file in repo dir for easy tailing; keep a stable base name and let the handler append dates
+log_file = Path(__file__).with_name("steuerung.log")
 fileHandler = TimedRotatingFileHandler(log_file, when="midnight", interval=1, backupCount=7, encoding="utf-8")
 fileHandler.setFormatter(formatter)
 logger.addHandler(fileHandler)

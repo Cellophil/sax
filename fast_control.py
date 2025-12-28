@@ -47,6 +47,10 @@ class FastControlConfig:
     # Discharge bias baseline
     discharge_bias_w: int = 1500
     discharge_bias_aggr_w: int = 3000
+    # Heartbeat interval seconds
+    hb_interval_s: float = 90.0
+    # After applying a large step, wait this long before reacting again
+    post_step_hold_s: float = 8.0
 
 
 class FastController:
@@ -82,6 +86,12 @@ class FastController:
         self._last_heartbeat = None
         self._meas_prev: Optional[float] = None
         self._meas_still_since: Optional[datetime] = None
+        # Observability snapshot
+        self.last_desired_w: int = 0
+        self.last_mode: str = self._mode
+        self.last_ema_w: float = 0.0
+        # Zero-reading stall detection
+        self._zero_hits: int = 0
 
     def set_mode(
         self,
@@ -158,6 +168,13 @@ class FastController:
             # Timestamp and filtered signal
             now_ts = datetime.now(ZoneInfo("Europe/Berlin"))
             raw = float(measured_net or 0.0)
+            # Optional hard clamp to avoid chasing implausible spikes
+            clamp = getattr(self.cfg, 'raw_clamp_w', None)
+            if isinstance(clamp, (int, float)) and clamp > 0:
+                if raw > clamp:
+                    raw = float(clamp)
+                elif raw < -clamp:
+                    raw = float(-clamp)
             # Track measurement staleness (no change over time)
             if self._meas_prev is None:
                 self._meas_prev = raw
@@ -172,6 +189,12 @@ class FastController:
                     self._meas_still_since = None
             if self._ema_net is None:
                 self._ema_net = raw
+
+            # Zero-reading stall detection (treat continuous exact zeros as missing data)
+            if raw == 0.0:
+                self._zero_hits += 1
+            else:
+                self._zero_hits = 0
 
             # Passive mode window due to pulsing loads
             in_passive = self._passive_until is not None and now_ts < self._passive_until
@@ -195,6 +218,7 @@ class FastController:
             if (not in_passive
                 and sum(self._pulse_hits) >= self.cfg.pulse_detect_min_hits
                 and consec < sustained_min_consec):
+                # deactivate switch to passive for now
                 from datetime import timedelta
                 self._passive_until = now_ts + timedelta(seconds=self.cfg.passive_cooldown_s)
                 in_passive = True
@@ -235,7 +259,53 @@ class FastController:
                         p_plan = - self._remaining_energy_Wh / remaining_h
                         desired += float(p_plan)
 
+            # Safeguard: in charge mode, never discharge
+            if self._mode == "charge" and desired > 0:
+                desired = 0
+
+            # Safeguard: if grid import is very high (raw << 0), forbid charging
+            try:
+                imp_thr = getattr(self.cfg, 'no_charge_if_import_above_w', None)
+                if isinstance(imp_thr, (int, float)) and imp_thr > 0 and raw < -float(imp_thr):
+                    if desired < 0:
+                        desired = 0
+            except Exception:
+                pass
+
             desired = self._clip_total(int(desired))
+
+            # Zero-stall handling: if we have seen too many exact zeros, ramp down and hold
+            try:
+                z_hits = self._zero_hits
+                z_thr = int(getattr(self.cfg, 'zero_stall_hits', 10))
+                if z_hits >= z_thr:
+                    desired = 0
+                    from datetime import timedelta as _td
+                    hold = float(getattr(self.cfg, 'zero_stall_hold_s', 20.0))
+                    self._passive_until = now_ts + _td(seconds=max(5.0, min(60.0, hold)))
+                    self.logger.warning("fast: zero-reading stall detected (hits=%d) → set desired=0 and enter passive for %.0fs", z_hits, hold)
+                    # reset counter but keep passive window
+                    self._zero_hits = 0
+            except Exception:
+                pass
+
+            # Post-step hold: if we just made a large change, pause reactivity briefly
+            try:
+                step_applied = abs(desired - self._last_target_w)
+                hold_s = getattr(self.cfg, 'post_step_hold_s', 0.0)
+                if hold_s and step_applied >= (max_step * 0.8):
+                    import asyncio as _asyncio
+                    await _asyncio.sleep(min(max(1.0, hold_s), 15.0))
+            except Exception:
+                pass
+
+            # Update observability snapshot
+            self.last_desired_w = int(desired)
+            self.last_mode = self._mode
+            try:
+                self.last_ema_w = float(self._ema_net)
+            except Exception:
+                pass
 
             # Apply via fleet
             socs = self.fleet.read_soc_all()
@@ -262,12 +332,13 @@ class FastController:
 
             self._last_ts = now_ts
 
-            # Heartbeat every ~30s with useful context
+            # Heartbeat every hb_interval_s with useful context
             try:
                 if self._last_heartbeat is None:
                     self._last_heartbeat = now_ts
                 hb_dt = (now_ts - self._last_heartbeat).total_seconds()
-                if hb_dt >= 30.0:
+                interval = getattr(self.cfg, 'hb_interval_s', 90.0)
+                if hb_dt >= interval:
                     stale_s = (now_ts - self._meas_still_since).total_seconds() if self._meas_still_since else 0.0
                     self.logger.info(
                         "fast hb mode=%s aggr=%s passive=%s tol=%d max_step=%d raw=%.1f ema=%.1f desired=%d batt=%d pulses(win=%d hits=%d consec=%d) meas_stale_s=%.0f",

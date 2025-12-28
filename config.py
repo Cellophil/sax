@@ -58,24 +58,32 @@ def get_effective_soc_limits(now: Optional[datetime] = None) -> Tuple[int, int]:
 # Fast-control default tuning (can be tweaked without code changes)
 FAST_CONTROL_DEFAULTS = {
     # sampling and tolerances
-    "sample_period_s": 3.0,
-    "tol_normal_w": 150,
-    "tol_aggressive_w": 50,
-    "max_step_w": 500,
+    "sample_period_s": 5.0,
+    "tol_normal_w": 250,
+    "tol_aggressive_w": 80,
+    "max_step_w": 300,
     "max_total_abs_w": 9000,
     # filtering and pulse handling
-    "ema_alpha_normal": 0.5,
+    "ema_alpha_normal": 0.2,
     "ema_alpha_passive": 0.2,
     "pulse_threshold_w": 350,
-    "pulse_detect_window": 8,
-    "pulse_detect_min_hits": 2,
-    "passive_cooldown_s": 45.0,
+    "pulse_detect_window": 10,
+    "pulse_detect_min_hits": 3,
+    "passive_cooldown_s": 50.0,
     "sustained_follow_secs": 10.0,
-    "tol_passive_w": 300,
-    "max_step_passive_w": 250,
+    "tol_passive_w": 350,
+    "max_step_passive_w": 220,
     # strategy nudges
     "discharge_bias_w": 1500,
     "discharge_bias_aggr_w": 3000,
     # charge behavior
     "charge_flat": True,
+    # logging cadence
+    "hb_interval_s": 90.0,
+    # control hygiene
+    "post_step_hold_s": 8.0,
+    # safety thresholds
+    "no_charge_if_import_above_w": 14000,
+    "zero_stall_hits": 10,
+    "zero_stall_hold_s": 20.0,
 }

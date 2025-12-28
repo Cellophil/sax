@@ -29,6 +29,7 @@ class TibberWSClient:
             self._log_every_n = max(1, int(os.getenv("SAX_TIBBER_WS_LOG_EVERY_N", "20")))
         except Exception:
             self._log_every_n = 20
+        self.last_msg_ts = None
 
     @property
     def running(self) -> bool:
@@ -174,6 +175,11 @@ class TibberWSClient:
                         payload = data.get("payload") or {}
                         # Normalize to shape {"data": {...}} expected by existing callback
                         if "data" in payload:
+                            # update last message timestamp
+                            try:
+                                self.last_msg_ts = asyncio.get_event_loop().time()
+                            except Exception:
+                                pass
                             callback({"data": payload["data"]})
                     elif t in ("error", "complete"):
                         if t == "error" and self.logger:

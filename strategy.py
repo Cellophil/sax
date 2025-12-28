@@ -337,20 +337,34 @@ def decide_strategy(ctx: StrategyContext) -> Tuple[Strategy, Optional[int]]:
     strategy_plot(ctx, n)
 
     if n.storage_units_t['p'].loc[t[0], 'battery'] > 100:
-        # we're discharging overall, balance
-        return Strategy.BALANCE, 0
+        # if there's currently pv in the system, balance carefully
+        if n.generators_t['p'].loc[t[0], 'pv'] > 0:
+            # if pv is present, balance aggressively
+            return Strategy.BALANCE, 0
+        else:
+            # pure discharge, possibly over night
+            #return Strategy.DISCHARGE, 0
+            return Strategy.BALANCE, 0
+
     if n.storage_units_t['p'].loc[t[0], 'battery'] < -100:
         # are we charging above PV generation?
-        try:
-            pv_now = float(n.generators_t['p'].loc[t[0], 'pv'])
-        except Exception:
-            pv_now = 0.0
-        if -n.storage_units_t['p'].loc[t[0], 'battery'] >= pv_now + 200:
+        if -n.storage_units_t['p'].loc[t[0], 'battery'] >= n.generators_t['p'].loc[t[0], 'pv'] + 200:
             # yes, we are charging above PV generation
             # Convert W at the first snapshot to Wh over 15 minutes: Wh = W * 0.25h
             return Strategy.CHARGE, int(-n.storage_units_t['p'].loc[t[0], 'battery'] * 0.25)
         # just charge normally
-        return Strategy.CHARGE, 0
+        else:
+            # are prices currently very low? allow balancing from battery?
+            uncaptured_pv_8h = (n.generators_t['p'].loc[t[:32], 'pv'] + n.storage_units_t['p'].loc[t[:32], 'battery']).sum()
+
+            if uncaptured_pv_8h > 1000:
+                return Strategy.BALANCE, 0
+
+            if ctx.prices_15.loc[t[0]] < ctx.prices_15.min() + 0.05:
+                return Strategy.CHARGE, 0
+            
+            return Strategy.BALANCE, 0
+            
 
     return Strategy.IDLE, 0
 
